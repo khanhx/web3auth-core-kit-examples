@@ -23,12 +23,15 @@ import { BN } from "bn.js";
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider, signInWithEmailAndPassword, signInWithPopup, UserCredential } from "firebase/auth";
 import { useEffect, useState } from "react";
+import { lagrangeInterpolation, } from "@tkey/tss";
 
 // IMP END - Quick Start
 // IMP START - Blockchain Calls
 // import RPC from "./ethersRPC";
 // import RPC from "./viemRPC";
 import RPC from "./web3RPC";
+import { keccak256 } from "ethers";
+import { AES, enc } from "crypto-js";
 // IMP END - Blockchain Calls
 
 // IMP START - Dashboard Registration
@@ -62,10 +65,94 @@ if (typeof window !== "undefined") {
   coreKitInstance = new Web3AuthMPCCoreKit({
     web3AuthClientId,
     web3AuthNetwork: WEB3AUTH_NETWORK.MAINNET,
-    storage: window.localStorage,
+    storage: {
+      getItem: (key: string) => {
+        console.log("getItem", key);
+        return localStorage.getItem(key);
+      },
+      setItem: (key: string, value: string) => {
+        console.log("setItem", key, value);
+        localStorage.setItem(key, value);
+      },
+    },
     manualSync: true, // This is the recommended approach
     tssLib,
+    disableHashedFactorKey: true,
+    enableLogging: true,
   });
+  (window as any).demo = async () => {
+    console.log(`Creating device factor`)
+    const deviceFactoryKey = await coreKitInstance.createFactor({
+      shareType: TssShareType.DEVICE,
+    });
+    console.log("🚀 ~ deviceFactoryKey:", deviceFactoryKey)
+
+    console.log(`Creating backup factor`)
+    const backupFactoryKey = await coreKitInstance.createFactor({
+      shareType: TssShareType.RECOVERY,
+    });
+    console.log("🚀 ~ backupFactoryKey:", backupFactoryKey)
+
+    console.log(`Getting device TSS share`)
+    const deviceTSSShare = await coreKitInstance.tKey.getTSSShare(new BN(deviceFactoryKey, 'hex'))
+    console.log("🚀 ~ deviceTSSShare:", {
+      tssIndex: deviceTSSShare.tssIndex,
+      tssShare: deviceTSSShare.tssShare.toJSON(),
+    });
+
+    console.log(`Getting backup TSS share`)
+    const backupTSSShare = await coreKitInstance.tKey.getTSSShare(new BN(backupFactoryKey, 'hex'))
+    console.log("🚀 ~ backupTSSShare:", {
+      tssIndex: backupTSSShare.tssIndex,
+      tssShare: backupTSSShare.tssShare.toJSON(),
+    });
+
+    const passcode = 123;
+
+    const encryptShare = (share: typeof deviceTSSShare) => {
+      return AES.encrypt(JSON.stringify({
+        tssIndex: share.tssIndex,
+        tssShare: share.tssShare.toJSON(),
+      }), passcode.toString()).toString();
+    }
+
+    const decryptShare = (share: string): { tssIndex: number, tssShare: any } => {
+      const decrypted = AES.decrypt(share, passcode.toString());
+      return JSON.parse(decrypted.toString(enc.Utf8));
+    }
+
+    const encryptedDeviceTSSShare = encryptShare(deviceTSSShare)
+
+    const encryptedBackupTSSShare = encryptShare(backupTSSShare)
+
+    const accountSalt = coreKitInstance['tkey']._accountSalt;
+
+    localStorage.setItem(`backupInfo`, JSON.stringify({
+      deviceTSSShare: encryptedDeviceTSSShare,
+      backupTSSShare: encryptedBackupTSSShare,
+      accountSalt,
+    }))
+  
+
+    const recover = async (share: string[], index: string[], accountSalt: string, accountIndex: number) => {
+      const finalKey = lagrangeInterpolation(coreKitInstance.tKey.tssCurve, share.map(item => new BN(item, 'hex')), index.map(item => new BN(item)));
+      const x = Buffer.from(`${accountIndex}${accountSalt}`);
+      let accountHash = keccak256(Buffer.from(`${accountIndex}${accountSalt}`) as any);
+      if (accountHash.length === 66) accountHash = accountHash.slice(2);
+      const accountNonce = accountIndex > 0 ? new BN(accountHash, "hex").umod(secp256k1.curve.n) : new BN(0);
+      const tssKey = finalKey.add(accountNonce).umod(secp256k1.curve.n);
+      return tssKey.toString("hex", 64);
+    }
+
+    const data = JSON.parse(localStorage.getItem(`backupInfo`) || '{}')
+    const decodeDeviceTSSShare = decryptShare(data.deviceTSSShare)
+    const decodeBackupTSSShare = decryptShare(data.backupTSSShare)
+
+    for (let i = 0; i < 10; i++) {
+      const privateKey = await recover([decodeDeviceTSSShare.tssShare, decodeBackupTSSShare.tssShare], [decodeDeviceTSSShare.tssIndex.toString(), decodeBackupTSSShare.tssIndex.toString()], data.accountSalt, i)
+      console.log(`recover account ${i} private key: ${privateKey}`)
+    }
+  }
 
   // Setup provider for EVM Chain
   evmProvider = new EthereumSigningProvider({ config: { chainConfig } });
@@ -227,8 +314,8 @@ function App() {
     try {
       const factorKey = new BN(await getSocialMFAFactorKey(), "hex");
       uiConsole("Using the Social Factor Key to Enable MFA, please wait...");
-      await coreKitInstance.enableMFA({ factorKey, shareDescription: FactorKeyTypeShareDescription.SocialShare });
-
+      const result = await coreKitInstance.enableMFA({ factorKey, shareDescription: FactorKeyTypeShareDescription.SocialShare });
+      uiConsole(result);
       if (coreKitInstance.status === COREKIT_STATUS.LOGGED_IN) {
         await coreKitInstance.commitChanges();
       }
@@ -286,6 +373,7 @@ function App() {
     if (!coreKitInstance) {
       throw new Error("coreKitInstance is not set");
     }
+    debugger;
     uiConsole("export share type: ", TssShareType.RECOVERY);
     const factorKey = generateFactorKey();
     await coreKitInstance.createFactor({
@@ -341,6 +429,7 @@ function App() {
   };
 
   const signMessage = async () => {
+    debugger;
     const signedMessage = await RPC.signMessage(evmProvider);
     uiConsole(signedMessage);
   };

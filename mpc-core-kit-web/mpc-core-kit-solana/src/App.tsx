@@ -9,15 +9,20 @@ import {
   keyToMnemonic,
   mnemonicToKey,
 } from "@web3auth/mpc-core-kit";
+import { AES, enc } from "crypto-js";
+import { decrypt, Point, secp256k1 } from "@tkey/common-types";
+import { getEd25519ExtendedPublicKey as getEd25519KeyPairFromSeed, getSecpKeyFromEd25519 } from "@toruslabs/torus.js";
 
 import { BN } from "bn.js";
 
 import { initializeApp } from "firebase/app";
 import { GoogleAuthProvider, getAuth, signInWithPopup, UserCredential } from "firebase/auth";
-
+import { lagrangeInterpolation, } from "@tkey/tss";
 import "./App.css";
 import { tssLib } from "@toruslabs/tss-frost-lib";
 import SolanaRPC from "./solanaRPC";
+import { Keypair } from "@solana/web3.js";
+import { keccak256 } from "ethers";
 
 const web3AuthClientId = "BPi5PB_UiIZ-cPz1GtV5i1I2iOSOHuimiXBI0e-Oe_u6X3oVAbCiAZOTEBtTXw4tsluTITPqA8zMsfxIKMjiqNQ"; // get from https://dashboard.web3auth.io
 
@@ -30,6 +35,79 @@ const coreKitInstance = new Web3AuthMPCCoreKit({
   manualSync: true,
   tssLib,
 });
+
+(window as any).demo = async () => {
+  console.log(`Creating device factor`)
+  const deviceFactoryKey = await coreKitInstance.createFactor({
+    shareType: TssShareType.DEVICE,
+  });
+  console.log("🚀 ~ deviceFactoryKey:", deviceFactoryKey)
+
+  console.log(`Creating backup factor`)
+  const backupFactoryKey = await coreKitInstance.createFactor({
+    shareType: TssShareType.RECOVERY,
+  });
+  console.log("🚀 ~ backupFactoryKey:", backupFactoryKey)
+
+  console.log(`Getting device TSS share`)
+  const deviceTSSShare = await coreKitInstance.tKey.getTSSShare(new BN(deviceFactoryKey, 'hex'))
+  console.log("🚀 ~ deviceTSSShare:", {
+    tssIndex: deviceTSSShare.tssIndex,
+    tssShare: deviceTSSShare.tssShare.toJSON(),
+  });
+
+  console.log(`Getting backup TSS share`)
+  const backupTSSShare = await coreKitInstance.tKey.getTSSShare(new BN(backupFactoryKey, 'hex'))
+  console.log("🚀 ~ backupTSSShare:", {
+    tssIndex: backupTSSShare.tssIndex,
+    tssShare: backupTSSShare.tssShare.toJSON(),
+  });
+
+  const passcode = 123;
+
+  const encryptShare = (share: typeof deviceTSSShare) => {
+    return AES.encrypt(JSON.stringify({
+      tssIndex: share.tssIndex,
+      tssShare: share.tssShare.toJSON(),
+    }), passcode.toString()).toString();
+  }
+
+  const decryptShare = (share: string): { tssIndex: number, tssShare: any } => {
+    const decrypted = AES.decrypt(share, passcode.toString());
+    return JSON.parse(decrypted.toString(enc.Utf8));
+  }
+
+  const encryptedDeviceTSSShare = encryptShare(deviceTSSShare)
+
+  const encryptedBackupTSSShare = encryptShare(backupTSSShare)
+
+  const metadata = coreKitInstance['tkey'].metadata.getGeneralStoreDomain('ed25519Seed/default')
+  localStorage.setItem(`backupInfo`, JSON.stringify({
+    deviceTSSShare: encryptedDeviceTSSShare,
+    backupTSSShare: encryptedBackupTSSShare,
+    metadata,
+  }))
+
+  console.log(`Backup info saved to localStorage`);
+
+  const recover = async (share: string[], index: string[], metadata: any) => {
+    const finalKey = lagrangeInterpolation(coreKitInstance.tKey.tssCurve, share.map(item => new BN(item, 'hex')), index.map(item => new BN(item)));
+    const accountNonce = new BN(0);
+    const tssKey = finalKey.add(accountNonce).umod(secp256k1.curve.n);
+    const decKey = getSecpKeyFromEd25519(new BN(tssKey, 'hex')).scalar;
+    const buffer = await decrypt(decKey.toArrayLike(Buffer, "be", 32), metadata.message);
+    const seed = Uint8Array.from(buffer);
+    const keypair = Keypair.fromSeed(seed);
+    return Buffer.from(keypair.secretKey).toString('base64');
+  }
+
+  const data = JSON.parse(localStorage.getItem(`backupInfo`) || '{}')
+  const decodeDeviceTSSShare = decryptShare(data.deviceTSSShare);
+  const decodeBackupTSSShare = decryptShare(data.backupTSSShare);
+  const seed = await recover([decodeDeviceTSSShare.tssShare, decodeBackupTSSShare.tssShare], [decodeDeviceTSSShare.tssIndex.toString(), decodeBackupTSSShare.tssIndex.toString()], data.metadata)
+  console.log(`recover seed: ${seed}`)
+}
+
 
 const firebaseConfig = {
   apiKey: "AIzaSyB0nd9YsPLu-tpdCrsXn8wgsWVAiYEpQ_E",
